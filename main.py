@@ -9,13 +9,9 @@ logging.basicConfig(level=logging.INFO)
 SWITCH_MSB = False
 ZERO_LENGTH_OCTET = "00000000"
 OCTET_SIZE = 8
-HOST, PORT = "8.8.8.8", 53
+HOST, PORT = "198.41.0.4", 53
 
-RANDOM_ID = random.randint(1, 100)
-try:
-    domain = sys.argv[1] + "."
-except IndexError:
-    raise Exception("No domain provided")
+RANDOM_ID = None
 
 
 def build_header(ID):
@@ -25,7 +21,7 @@ def build_header(ID):
     opcode = "0000"
     aa = "0"
     tc = "0"
-    rd = "1"
+    rd = "0"
     ra = "0"
     z = "000"
     rcode = "0000"
@@ -45,6 +41,31 @@ def build_question(domain):
     qtype = f"{1:016b}"
     qclass = f"{1:016b}"
     return "".join(v for k, v in locals().items() if k != "domain")
+
+
+def build_request(domain, random_id):
+    global SWITCH_MSB
+    header = build_header(random_id)
+    question = build_question(domain)
+    request = header + question
+    if request.startswith("0"):
+        request = "1" + request[1:]
+        SWITCH_MSB = True
+    request = f"{int(request, 2):x}"
+    return request
+
+
+def send_request_and_receive_response(request):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect_ex((HOST, PORT))
+    s.sendall(bytes.fromhex(request))
+    response = s.recv(1024)
+    response = response.hex()
+    response = f"{int(response, 16):b}"
+    if SWITCH_MSB:
+        response = "0" + response[1:]
+    # logging.debug(f"{response=}")
+    return response
 
 
 def read_bits(bit_string, start, size, as_int=False):
@@ -76,17 +97,28 @@ def parse_header(response, start):
     return header, start
 
 
+def handle_pointer(response, start):
+    prefix, start = read_bits(response, start, 2)
+    offset, start = read_bits(response, start, 14, as_int=True)
+    return parse_name(response, offset * OCTET_SIZE)[0], start
+
+
 def parse_name(response, start):
     if response[start : start + 2] == "11":
-        logging.debug("pointer")
-        prefix, start = read_bits(response, start, 2)
-        offset, start = read_bits(response, start, 14, as_int=True)
-        return parse_name(response, offset * OCTET_SIZE)[0], start
+        # logging.debug("parse_name | pointer at start")
+        return handle_pointer(response, start)
     parts = []
-    while (
-        t := read_bits(response, start, OCTET_SIZE, as_int=True)
-    ) != ZERO_LENGTH_OCTET:
-        length, start = t
+    name_from_pointer = ""
+    while True:
+        # check pointer
+        if response[start : start + 2] == "11":
+            # logging.debug("parse_name | pointer at end")
+            name_from_pointer, start = handle_pointer(response, start)
+            break
+        else:
+            length, start = read_bits(response, start, OCTET_SIZE)
+
+        length = int(length, 2)
         if length == 0:
             break
         part = []
@@ -95,7 +127,8 @@ def parse_name(response, start):
             char = chr(int(char_octet, 2))
             part.append(char)
         parts.append(part)
-    return ".".join("".join(part) for part in parts), start
+    name = (".".join("".join(part) for part in parts + [name_from_pointer])).rstrip(".")
+    return name, start
 
 
 def parse_question(response, start):
@@ -109,14 +142,23 @@ def parse_question(response, start):
 
 def parse_rdata(response, start, rdlength, rtype, rclass):
     if rtype == 1 and rclass == 1:
-        logging.debug("ARPA Internet address")
+        # logging.debug("ARPA Internet address")
         parts = []
         for _ in range(rdlength):
             part, start = read_bits(response, start, OCTET_SIZE, as_int=True)
             parts.append(part)
+        return ".".join(map(str, parts)), start
+    elif rtype == 2 and rclass == 1:
+        # logging.debug("authoritative name server")
+        name, start = parse_name(response, start)
+        return name, start
+    elif rtype == 28 and rclass == 1:
+        # TODO: handle this later
+        # logging.debug("ipv6")
+        _, start = read_bits(response, start, 128)
+        return "ipv6", start
     else:
-        raise Exception("Unspported rtype/rclass")
-    return ".".join(map(str, parts)), start
+        raise Exception(f"Unspported rtype/rclass | {rtype=} | {rclass=}")
 
 
 def parse_resource_record(response, start):
@@ -131,43 +173,70 @@ def parse_resource_record(response, start):
     return rrecord, start
 
 
-# build request
-header = build_header(RANDOM_ID)
-question = build_question(domain)
-request = header + question
-if request.startswith("0"):
-    request = "1" + request[1:]
-    SWITCH_MSB = True
-request = f"{int(request, 2):x}"
+def parse_response(response):
+    start = 0
+    header, start = parse_header(response, start)
+    logging.debug(f"{header=}")
 
-# send request, receive response
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.connect_ex((HOST, PORT))
-s.sendall(bytes.fromhex(request))
-response = s.recv(1024)
+    question, start = parse_question(response, start)
+    logging.debug(f"{question=}")
 
-# parse response
-response = response.hex()
-response = f"{int(response, 16):b}"
-if SWITCH_MSB:
-    response = "0" + response[1:]
-logging.debug(f"{response=}")
+    answer_list = []
+    for _ in range(header["ancount"]):
+        answer, start = parse_resource_record(response, start)
+        logging.debug(f"{answer=}")
+        answer_list.append(answer)
 
-start = 0
-header, start = parse_header(response, start)
-logging.debug(f"{header=}")
+    authority_list = []
+    for _ in range(header["nscount"]):
+        authority, start = parse_resource_record(response, start)
+        logging.debug(f"{authority=}")
+        authority_list.append(authority)
 
-question, start = parse_question(response, start)
-logging.debug(f"{question=}")
+    additional_list = []
+    for _ in range(header["arcount"]):
+        additional, start = parse_resource_record(response, start)
+        logging.debug(f"{additional=}")
+        additional_list.append(additional)
 
-for _ in range(header["ancount"]):
-    answer, start = parse_resource_record(response, start)
-    logging.info(f"{answer=}")
+    return {
+        "header": header,
+        "question": question,
+        "answer": answer_list,
+        "authority": authority_list,
+        "additional": additional_list,
+    }
 
-for _ in range(header["nscount"]):
-    authority, start = parse_resource_record(response, start)
-    logging.info(f"{authority=}")
 
-for _ in range(header["arcount"]):
-    additional, start = parse_resource_record(response, start)
-    logging.info(f"{additional=}")
+def main(domain):
+    global RANDOM_ID, HOST
+    random_id = RANDOM_ID = random.randint(1, 100)
+    print(f"querying {HOST} for {domain}")
+    request = build_request(domain + ".", random_id)
+    response = send_request_and_receive_response(request)
+    parsed_response = parse_response(response)
+    if parsed_response["answer"]:
+        return parsed_response["answer"]
+    else:
+        if parsed_response["additional"]:
+            additional_ips = [
+                r["rdata"] for r in parsed_response["additional"] if r["rtype"] == 1
+            ]
+            HOST = additional_ips[0]
+            return main(domain)
+        else:
+            authority_names = [r["rdata"] for r in parsed_response["authority"]]
+            answers = main(authority_names[0])
+            if answers:
+                HOST = answers[0]["rdata"]
+                return main(domain)
+
+
+if __name__ == "__main__":
+    try:
+        domain = sys.argv[1]
+    except IndexError:
+        raise Exception("No domain provided")
+    answers = main(domain)
+    for answer in answers:
+        print(answer)
