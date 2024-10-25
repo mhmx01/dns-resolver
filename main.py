@@ -60,6 +60,7 @@ def send_request_and_receive_response(request):
     s.connect_ex((HOST, PORT))
     s.sendall(bytes.fromhex(request))
     response = s.recv(1024)
+    s.close()
     response = response.hex()
     response = f"{int(response, 16):b}"
     if SWITCH_MSB:
