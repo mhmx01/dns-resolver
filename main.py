@@ -2,7 +2,7 @@
 import logging
 import random
 import socket
-import sys
+import argparse
 
 logging.basicConfig(level=logging.INFO)
 
@@ -234,10 +234,11 @@ def main(domain):
 
 
 if __name__ == "__main__":
-    try:
-        domain = sys.argv[1]
-    except IndexError:
-        raise Exception("No domain provided")
-    answers = main(domain)
+    parser = argparse.ArgumentParser(
+        description="query the ip address for a given domain name."
+    )
+    parser.add_argument("domain", help="the domain to query.")
+    args = parser.parse_args()
+    answers = main(args.domain)
     for answer in answers:
         print(answer)
